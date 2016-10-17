@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/ast"
@@ -48,8 +49,10 @@ func Execute(p ExecuteParams) (result *Result) {
 			if r, ok := r.(error); ok {
 				err = gqlerrors.FormatError(r)
 			}
-			exeContext.Errors = append(exeContext.Errors, gqlerrors.FormatError(err))
-			result.Errors = exeContext.Errors
+			// exeContext.Errors = append(exeContext.Errors, gqlerrors.FormatError(err))
+			// result.Errors = exeContext.Errors
+			exeContext.AppendError(err)
+			result.Errors = exeContext.Errors()
 		}
 	}()
 
@@ -76,12 +79,39 @@ type ExecutionContext struct {
 	Root           interface{}
 	Operation      ast.Definition
 	VariableValues map[string]interface{}
-	Errors         []gqlerrors.FormattedError
-	Context        context.Context
+	// Errors         []gqlerrors.FormattedError
+	Context context.Context
+	errLock sync.RWMutex
+	errors  []gqlerrors.FormattedError
+}
+
+func (eCtx *ExecutionContext) AppendError(errs ...error) {
+	formattedErrors := []gqlerrors.FormattedError{}
+	for _, err := range errs {
+		formattedErrors = append(formattedErrors, gqlerrors.FormatError(err))
+	}
+	eCtx.errLock.Lock()
+	eCtx.errors = append(eCtx.errors, formattedErrors...)
+	eCtx.errLock.Unlock()
+}
+
+func (eCtx *ExecutionContext) Errors() (res []gqlerrors.FormattedError) {
+	eCtx.errLock.RLock()
+	res = eCtx.errors
+	eCtx.errLock.RUnlock()
+	return res
+}
+
+func (eCtx *ExecutionContext) SetErrors(errors []gqlerrors.FormattedError) {
+	eCtx.errLock.Lock()
+	eCtx.errors = errors
+	eCtx.errLock.Unlock()
 }
 
 func buildExecutionContext(p BuildExecutionCtxParams) (*ExecutionContext, error) {
-	eCtx := &ExecutionContext{}
+	eCtx := &ExecutionContext{
+		errLock: sync.RWMutex{},
+	}
 	var operation *ast.OperationDefinition
 	fragments := map[string]ast.Definition{}
 
@@ -122,7 +152,8 @@ func buildExecutionContext(p BuildExecutionCtxParams) (*ExecutionContext, error)
 	eCtx.Root = p.Root
 	eCtx.Operation = operation
 	eCtx.VariableValues = variableValues
-	eCtx.Errors = p.Errors
+	// eCtx.Errors = p.Errors
+	eCtx.SetErrors(p.Errors)
 	eCtx.Context = p.Context
 	return eCtx, nil
 }
@@ -232,13 +263,15 @@ func executeFieldsSerially(p ExecuteFieldsParams) *Result {
 	}
 
 	return &Result{
-		Data:   finalResults,
-		Errors: p.ExecutionContext.Errors,
+		Data: finalResults,
+		// Errors: p.ExecutionContext.Errors,
+		Errors: p.ExecutionContext.Errors(),
 	}
 }
 
 // Implements the "Evaluating selection sets" section of the spec for "read" mode.
 func executeFields(p ExecuteFieldsParams) *Result {
+	fmt.Print("executeFields\n")
 	if p.Source == nil {
 		p.Source = map[string]interface{}{}
 	}
@@ -246,18 +279,61 @@ func executeFields(p ExecuteFieldsParams) *Result {
 		p.Fields = map[string][]*ast.Field{}
 	}
 
-	finalResults := map[string]interface{}{}
+	// finalResults := map[string]interface{}{}
+	type resolvedChanResult struct {
+		responseName string
+		resolved     interface{}
+		state        resolveFieldResultState
+		panicErr     error
+	}
+
+	// concurrently resolve fields
+	var wg sync.WaitGroup
+	resolvedChan := make(chan resolvedChanResult, len(p.Fields))
 	for responseName, fieldASTs := range p.Fields {
-		resolved, state := resolveField(p.ExecutionContext, p.ParentType, p.Source, fieldASTs)
-		if state.hasNoFieldDefs {
+		fmt.Printf("responseName:%+v\n", responseName)
+		// resolved, state := resolveField(p.ExecutionContext, p.ParentType, p.Source, fieldASTs)
+		// if state.hasNoFieldDefs {
+		wg.Add(1)
+		go func(responseName string, fieldASTs []*ast.Field) (resolved interface{}, state resolveFieldResultState, panicErr error) {
+			defer func() {
+				if r := recover(); r != nil {
+					if r, ok := r.(error); ok {
+						// recover panic that was thrown by resolveFields(),
+						// indicating that we should short-circuit traversal chain later
+						panicErr = r
+					}
+				}
+				resolvedChan <- resolvedChanResult{responseName, resolved, state, panicErr}
+				wg.Done()
+			}()
+			resolved, state = resolveField(p.ExecutionContext, p.ParentType, p.Source, fieldASTs)
+			return resolved, state, panicErr
+		}(responseName, fieldASTs)
+	}
+
+	// wait for all routines to complete and then perform clean up
+	wg.Wait()
+	close(resolvedChan)
+
+	// iterate through resolved results
+	finalResults := map[string]interface{}{}
+	for result := range resolvedChan {
+		if result.panicErr != nil {
+			// short-circuit field resolution traversal chain
+			panic(result.panicErr)
+		}
+		if result.state.hasNoFieldDefs {
 			continue
 		}
-		finalResults[responseName] = resolved
+		// finalResults[responseName] = resolved
+		finalResults[result.responseName] = result.resolved
 	}
 
 	return &Result{
-		Data:   finalResults,
-		Errors: p.ExecutionContext.Errors,
+		Data: finalResults,
+		// Errors: p.ExecutionContext.Errors,
+		Errors: p.ExecutionContext.Errors(),
 	}
 }
 
@@ -266,6 +342,7 @@ type CollectFieldsParams struct {
 	RuntimeType          *Object // previously known as OperationType
 	SelectionSet         *ast.SelectionSet
 	Fields               map[string][]*ast.Field
+	FieldOrder           []string
 	VisitedFragmentNames map[string]bool
 }
 
@@ -495,7 +572,8 @@ func resolveField(eCtx *ExecutionContext, parentType *Object, source interface{}
 			if _, ok := returnType.(*NonNull); ok {
 				panic(gqlerrors.FormatError(err))
 			}
-			eCtx.Errors = append(eCtx.Errors, gqlerrors.FormatError(err))
+			// eCtx.Errors = append(eCtx.Errors, gqlerrors.FormatError(err))
+			eCtx.AppendError(err)
 			return result, resultState
 		}
 		return result, resultState
@@ -545,7 +623,9 @@ func resolveField(eCtx *ExecutionContext, parentType *Object, source interface{}
 	})
 
 	if resolveFnError != nil {
-		panic(gqlerrors.FormatError(resolveFnError))
+		// panic(gqlerrors.FormatError(resolveFnError))
+		eCtx.AppendError(resolveFnError)
+		return nil, resultState
 	}
 
 	completed := completeValueCatchingError(eCtx, returnType, fieldASTs, info, result)
@@ -561,7 +641,8 @@ func completeValueCatchingError(eCtx *ExecutionContext, returnType Type, fieldAS
 				panic(r)
 			}
 			if err, ok := r.(gqlerrors.FormattedError); ok {
-				eCtx.Errors = append(eCtx.Errors, err)
+				// eCtx.Errors = append(eCtx.Errors, err)
+				eCtx.AppendError(err)
 			}
 			return completed
 		}
@@ -757,11 +838,61 @@ func completeListValue(eCtx *ExecutionContext, returnType *List, fieldASTs []*as
 
 	itemType := returnType.OfType
 	completedResults := []interface{}{}
-	for i := 0; i < resultVal.Len(); i++ {
-		val := resultVal.Index(i).Interface()
-		completedItem := completeValueCatchingError(eCtx, itemType, fieldASTs, info, val)
-		completedResults = append(completedResults, completedItem)
+	fmt.Printf("completeListValue\n")
+	fmt.Printf("resultVal length:%+v\n", resultVal.Len())
+	var wg sync.WaitGroup
+
+	// Number of goroutines to use.
+	numberGoroutines := 3
+	// Amount of work to process.
+	taskLoad := resultVal.Len()
+
+	// Create a buffered channel to manage the task load.
+	tasks := make(chan interface{}, taskLoad)
+
+	// Launch goroutines to handle the work.
+	wg.Add(numberGoroutines)
+
+	for gr := 0; gr < numberGoroutines; gr++ {
+		go func(tasks chan interface{}) {
+			defer wg.Done()
+			for {
+				// Wait for work to be assigned.
+				task, ok := <-tasks
+				if !ok {
+					// This means the channel is empty and closed.
+					fmt.Printf("Worker Shutting Down\n")
+					return
+				}
+				fmt.Printf("completeListValue\n")
+				// fmt.Printf("val:%+v", val)
+				// val := resultVal.Index(i).Interface()
+				completedItem := completeValueCatchingError(eCtx, itemType, fieldASTs, info, task)
+				completedResults = append(completedResults, completedItem)
+			}
+		}(tasks)
 	}
+
+	// Add a bunch of work to get done.
+	for i := 0; i < taskLoad; i++ {
+		val := resultVal.Index(i).Interface()
+		tasks <- val
+	}
+
+	// for i := 0; i < resultVal.Len(); i++ {
+	// 	val := resultVal.Index(i).Interface()
+	// 	wg.Add(1)
+	// 	go func(val interface{}) {
+	// 		fmt.Printf("completeListValue\n")
+	// 		fmt.Printf("val:%+v", val)
+	// 		completedItem := completeValueCatchingError(eCtx, itemType, fieldASTs, info, val)
+	// 		completedResults = append(completedResults, completedItem)
+	// 		wg.Done()
+	// 	}(val)
+	// }
+	close(tasks)
+	wg.Wait()
+	fmt.Println("completeListValue execution")
 	return completedResults
 }
 
